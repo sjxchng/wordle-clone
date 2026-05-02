@@ -3,7 +3,7 @@ import Board from "./Board"
 import Keyboard from "./Keyboard"
 
 // FastAPI backend URL used by every fetch call in this component
-const API = "http://localhost:8000"
+const API = "https://wordle-clone-backend-se82.onrender.com"
 const WORD_LENGTH = 5
 const MAX_ATTEMPTS = 6
 
