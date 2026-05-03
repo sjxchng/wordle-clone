@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react"
 import Board from "./Board"
 import Keyboard from "./Keyboard"
+import Auth from "./Auth"
 
 // FastAPI backend URL used by every fetch call in this component
 const API = "https://wordle-clone-backend-se82.onrender.com"
@@ -8,11 +9,11 @@ const WORD_LENGTH = 5
 const MAX_ATTEMPTS = 6
 
 export default function App() {
-  // guesses: array of submitted guesses, each with letters and feedback colors
+  // token: JWT token stored in localStorage so it persists across page refreshes
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem("token"))
+
   const [guesses, setGuesses] = useState<{ letters: string[]; feedbacks: string[] }[]>([])
-  // currentGuess: the word the user is currently typing, not yet submitted
   const [currentGuess, setCurrentGuess] = useState("")
-  // keyStatuses: maps each letter to its best known feedback color (green > yellow > gray)
   const [keyStatuses, setKeyStatuses] = useState<Record<string, string>>({})
   const [gameOver, setGameOver] = useState(false)
   const [won, setWon] = useState(false)
@@ -28,12 +29,22 @@ export default function App() {
       .catch(() => setMessage("Could not connect to the game server."))
   }, [])
 
+  // called by Auth component after successful login — saves token to state and localStorage
+  function handleLogin(newToken: string) {
+    localStorage.setItem("token", newToken)
+    setToken(newToken)
+    setCurrentGuess("") // clear any keystrokes typed during login
+  }
+
+  // log out by clearing the token from state and localStorage
+  function handleLogout() {
+    localStorage.removeItem("token")
+    setToken(null)
+  }
+
   // updateKeyboardStatuses: called after each guess to color the keyboard keys
-  // useCallback memoizes this function so it doesn't get recreated on every render
-  // which matters because submitGuess depends on it
   const updateKeyboardStatuses = useCallback((guess: string, feedback: string[]) => {
     // green=3, yellow=2, gray=1 — keys only ever upgrade, never downgrade
-    // so a green key stays green even if the same letter shows up gray later
     const priority: Record<string, number> = { green: 3, yellow: 2, gray: 1 }
 
     setKeyStatuses((prev) => {
@@ -46,23 +57,31 @@ export default function App() {
       })
       return next
     })
-  }, []) // no dependencies — priority is a constant defined inside the function
+  }, [])
 
-  // submitGuess: POSTs the current guess to the backend and processes the response
-  // useCallback ensures handleKey always has the latest version of this function
+  // submitGuess: POSTs the current guess to the backend with the JWT token in the header
   const submitGuess = useCallback(async () => {
     setLoading(true) // block input while the request is in flight
 
     try {
       const res = await fetch(`${API}/guess`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`, // send JWT token so backend knows who is guessing
+        },
         body: JSON.stringify({ guess: currentGuess }),
       })
 
+      if (res.status === 401) {
+        // token expired or invalid — log out and show login screen
+        handleLogout()
+        return
+      }
+
       if (!res.ok) {
         const err = await res.json()
-        setMessage(err.detail) // show backend error like "Not a valid word"
+        setMessage(err.detail)
         return
       }
 
@@ -71,8 +90,8 @@ export default function App() {
 
       setGuesses((prev) => [...prev, newGuess])
       setCurrentGuess("")
-      setMessage("") // clear any previous error on a successful guess
-      setAnswer(data.answer) // backend returns the answer on every guess per the spec
+      setMessage("")
+      setAnswer(data.answer)
 
       updateKeyboardStatuses(data.guess, data.feedback)
 
@@ -85,14 +104,13 @@ export default function App() {
     } catch {
       setMessage("Could not submit guess. Is the backend running?")
     } finally {
-      setLoading(false) // always unblock input, even if the request threw
+      setLoading(false)
     }
-  }, [currentGuess, guesses.length, updateKeyboardStatuses])
+  }, [currentGuess, guesses.length, token, updateKeyboardStatuses])
 
   // handleKey: processes input from both the physical keyboard and the on-screen keyboard
-  // useCallback with its dependencies ensures this always has fresh state values
   const handleKey = useCallback((key: string) => {
-    if (gameOver || loading) return // ignore input when game is over or request is in flight
+    if (gameOver || loading) return
 
     if (key === "⌫" || key === "Backspace") {
       setCurrentGuess((g) => g.slice(0, -1))
@@ -108,18 +126,15 @@ export default function App() {
       return
     }
 
-    // only accept single alphabetical characters
     if (key.length === 1 && key.match(/[a-zA-Z]/)) {
       if (currentGuess.length < WORD_LENGTH) {
         setCurrentGuess((g) => g + key.toLowerCase())
-        setMessage("") // clear error when user starts typing again
+        setMessage("")
       }
     }
   }, [currentGuess.length, gameOver, loading, submitGuess])
 
   // listen for physical keyboard input
-  // the cleanup function removes the old listener before adding a new one
-  // this ensures handleKey always has the latest state values
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       handleKey(e.key)
@@ -128,9 +143,30 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKeyDown)
   }, [handleKey]) // re-runs whenever handleKey changes (i.e. whenever state changes)
 
+  // if no token, show the login/register screen
+  if (!token) {
+    return <Auth onLogin={handleLogin} />
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 40 }}>
-      <h1 style={{ color: "white", marginBottom: 20 }}>Definitely Not Wordle</h1>
+      <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 20 }}>
+        <h1 style={{ color: "white", margin: 0 }}>Definitely Not Wordle</h1>
+        <button
+          onClick={handleLogout}
+          style={{
+            background: "none",
+            border: "1px solid #3a3a3c",
+            color: "#818384",
+            borderRadius: 4,
+            padding: "4px 10px",
+            cursor: "pointer",
+            fontSize: 13,
+          }}
+        >
+          Log out
+        </button>
+      </div>
       <Board guesses={guesses} currentGuess={currentGuess} maxAttempts={MAX_ATTEMPTS} />
       <Keyboard keyStatuses={keyStatuses} onKey={handleKey} />
       {message && (
