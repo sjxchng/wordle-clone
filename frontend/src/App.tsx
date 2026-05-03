@@ -226,21 +226,24 @@ export default function App() {
   const [answer, setAnswer] = useState("")
   const [message, setMessage] = useState("") // error messages like "Not a valid word"
   const [loading, setLoading] = useState(false) // true while a guess request is in flight
+  const [showWakeupNotice, setShowWakeupNotice] = useState(false)
 
   const applyGameState = useCallback((data: GameState, storageToken = token) => {
     const cached = readStoredGame(storageToken)
     const serverGuesses = data.guesses ?? []
     const savedGuesses = serverGuesses.length > 0 ? serverGuesses : cached.guesses
-    const completed = Boolean(data.completed) || cached.completed
+    const completed = savedGuesses.length >= MAX_ATTEMPTS || Boolean(data.completed) || cached.completed
+    const hasPlayableState = savedGuesses.length > 0
+    const shouldBlockInput = completed && hasPlayableState
     const savedWon = Boolean(data.won) || cached.won
 
     setGuesses(savedGuesses)
     setKeyStatuses(rebuildKeyStatuses(savedGuesses))
     setCurrentGuess("")
-    setGameOver(completed)
+    setGameOver(shouldBlockInput)
     setWon(savedWon)
-    setShowResult(completed)
-    writeStoredGame(storageToken, { guesses: savedGuesses, completed, won: savedWon })
+    setShowResult(shouldBlockInput)
+    writeStoredGame(storageToken, { guesses: savedGuesses, completed: shouldBlockInput, won: savedWon })
   }, [token])
 
   // log out by clearing the token from state and localStorage
@@ -288,10 +291,17 @@ export default function App() {
 
   // fetch the answer when the app loads so we can reveal it on a loss
   useEffect(() => {
+    const wakeupTimer = window.setTimeout(() => setShowWakeupNotice(true), 2000)
+
     fetch(`${API}/answer`)
       .then((r) => r.json())
-      .then((data) => setAnswer(data.answer))
+      .then((data) => {
+        setAnswer(data.answer)
+        setShowWakeupNotice(false)
+      })
       .catch(() => setMessage("Could not connect to the game server."))
+
+    return () => window.clearTimeout(wakeupTimer)
   }, [])
 
   // restore today's game state when a logged-in user loads the page
@@ -508,6 +518,16 @@ export default function App() {
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 30 }}>
         <Board guesses={guesses} currentGuess={currentGuess} maxAttempts={MAX_ATTEMPTS} />
         <Keyboard keyStatuses={keyStatuses} onKey={handleKey} />
+        {showWakeupNotice && !answer && (
+          <p style={{ color: "#818384", marginTop: 20, fontSize: 13 }}>
+            Waking up the free backend. First request may take up to a minute.
+          </p>
+        )}
+        {gameOver && !showResult && (
+          <p style={{ color: "#d7dadc", marginTop: 20, fontSize: 16 }}>
+            Today's game is complete. Come back tomorrow for a new word.
+          </p>
+        )}
         {message && <p style={{ color: "white", marginTop: 20, fontSize: 18 }}>{message}</p>}
         {/* prompt guests to log in for progress tracking */}
         {!token && (
