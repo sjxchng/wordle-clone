@@ -228,14 +228,17 @@ export default function App() {
   const [loading, setLoading] = useState(false) // true while a guess request is in flight
   const [showWakeupNotice, setShowWakeupNotice] = useState(false)
 
-  const applyGameState = useCallback((data: GameState, storageToken = token) => {
+  const applyGameState = useCallback((data: GameState, storageToken = token, useCacheFallback = false) => {
     const cached = readStoredGame(storageToken)
     const serverGuesses = data.guesses ?? []
-    const savedGuesses = serverGuesses.length > 0 ? serverGuesses : cached.guesses
-    const completed = savedGuesses.length >= MAX_ATTEMPTS || Boolean(data.completed) || cached.completed
+    const savedGuesses = serverGuesses.length > 0 ? serverGuesses : useCacheFallback ? cached.guesses : []
+    const completed =
+      savedGuesses.length >= MAX_ATTEMPTS ||
+      Boolean(data.completed) ||
+      (useCacheFallback && cached.completed)
     const hasPlayableState = savedGuesses.length > 0
     const shouldBlockInput = completed && hasPlayableState
-    const savedWon = Boolean(data.won) || cached.won
+    const savedWon = Boolean(data.won) || (useCacheFallback && cached.won)
 
     setGuesses(savedGuesses)
     setKeyStatuses(rebuildKeyStatuses(savedGuesses))
@@ -278,14 +281,14 @@ export default function App() {
       }
 
       if (!res.ok) {
-        applyGameState({}, authToken)
+        applyGameState({}, authToken, true)
         return
       }
 
       const data = await res.json()
       applyGameState(data, authToken)
     } catch {
-      applyGameState({}, authToken)
+      applyGameState({}, authToken, true)
     }
   }, [applyGameState, handleLogout])
 
@@ -311,7 +314,7 @@ export default function App() {
 
     Promise.resolve()
       .then(() => loadGameState(token))
-      .catch(() => applyGameState({}, token))
+      .catch(() => applyGameState({}, token, true))
   }, [applyGameState, loadGameState, token])
 
   // called by Auth component after successful login — saves token to state and localStorage
