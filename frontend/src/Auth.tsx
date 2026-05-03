@@ -28,7 +28,6 @@ export default function Auth({ onLogin }: { onLogin: (token: string) => void }) 
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ username, password }),
         })
-
         if (!res.ok) {
           const err = await res.json()
           setMessage(err.detail)
@@ -63,14 +62,17 @@ export default function Auth({ onLogin }: { onLogin: (token: string) => void }) 
 
   return (
     <div style={{
+      backgroundColor: "#121213",
+      border: "1px solid #3a3a3c",
+      borderRadius: 8,
+      padding: 32,
       display: "flex",
       flexDirection: "column",
       alignItems: "center",
-      paddingTop: 80,
       gap: 12,
+      minWidth: 320,
     }}>
-      <h1 style={{ color: "white", marginBottom: 8 }}>Definitely Not Wordle</h1>
-      <h2 style={{ color: "#818384", fontWeight: "normal", marginBottom: 16 }}>
+      <h2 style={{ color: "white", margin: "0 0 8px 0" }}>
         {isRegistering ? "Create an account" : "Log in to play"}
       </h2>
 
@@ -94,9 +96,9 @@ export default function Auth({ onLogin }: { onLogin: (token: string) => void }) 
         {loading ? "..." : isRegistering ? "Register" : "Log In"}
       </button>
 
-      {message && <p style={{ color: "#ff4444", fontSize: 14 }}>{message}</p>}
+      {message && <p style={{ color: "#ff4444", fontSize: 14, margin: 0 }}>{message}</p>}
 
-      <p style={{ color: "#818384", fontSize: 14, marginTop: 8 }}>
+      <p style={{ color: "#818384", fontSize: 14, margin: 0 }}>
         {isRegistering ? "Already have an account?" : "Don't have an account?"}{" "}
         <span
           onClick={() => { setIsRegistering(!isRegistering); setMessage("") }}
@@ -110,9 +112,9 @@ export default function Auth({ onLogin }: { onLogin: (token: string) => void }) 
 }
 
 const inputStyle: React.CSSProperties = {
-  width: 280,
+  width: 260,
   padding: "10px 14px",
-  backgroundColor: "#121213",
+  backgroundColor: "#1a1a1b",
   border: "2px solid #3a3a3c",
   borderRadius: 4,
   color: "white",
@@ -121,7 +123,7 @@ const inputStyle: React.CSSProperties = {
 }
 
 const buttonStyle: React.CSSProperties = {
-  width: 308,
+  width: 288,
   padding: "12px 0",
   backgroundColor: "#538d4e",
   color: "white",
