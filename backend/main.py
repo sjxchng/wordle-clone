@@ -3,14 +3,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel # lets us define the shape of incoming request bodies
 import os
-import random
 import httpx # async HTTP client for calling the Merriam-Webster API
 import datetime
 from dotenv import load_dotenv # loads environment variables from .env file
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from sqlalchemy import create_engine, Column, String, Integer, Boolean, Date, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, Date, ForeignKey, Text, inspect, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from typing import Optional
 
 load_dotenv() # reads .env and makes its values available via os.getenv()
 DICTIONARY_API_KEY = os.getenv("DICTIONARY_API_KEY") # grab the MW API key from environment
@@ -24,8 +24,8 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # tokens last 24 hours
 # password hashing — bcrypt is the industry standard
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# OAuth2 — tells FastAPI where the login endpoint is
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+# oauth2_scheme with auto_error=False means auth is optional — unauthenticated requests are allowed
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
 
 app = FastAPI()
 
@@ -83,6 +83,7 @@ class GameRecord(Base):
         guesses: Number of guesses used.
         won: Whether the user won.
         completed: Whether the game is finished (won or lost).
+        guess_history: JSON string of all guesses and their feedback.
     """
     __tablename__ = "game_records"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -91,10 +92,33 @@ class GameRecord(Base):
     guesses = Column(Integer, default=0)
     won = Column(Boolean, default=False)
     completed = Column(Boolean, default=False)
+    guess_history = Column(Text, default="[]")  # stores guesses as JSON string
 
 
 # create tables if they don't exist yet
 Base.metadata.create_all(bind=engine)
+
+
+def ensure_game_record_schema():
+    """Add columns that older deployed databases may be missing.
+
+    SQLAlchemy's create_all creates missing tables, but it does not alter tables
+    that already exist. This keeps the Render database compatible after adding
+    progress restoration.
+    """
+    inspector = inspect(engine)
+    if "game_records" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("game_records")}
+    if "guess_history" in columns:
+        return
+
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE game_records ADD COLUMN guess_history TEXT DEFAULT '[]'"))
+
+
+ensure_game_record_schema()
 
 
 def get_db():
@@ -162,21 +186,23 @@ def create_access_token(username: str) -> str:
     return jwt.encode({"sub": username, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
 
 
-def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Optional[User]:
     """Decode a JWT token and return the corresponding user.
 
-    Used as a FastAPI dependency on protected endpoints.
+    Returns None if no token is provided — allows guest access.
 
     Args:
-        token: JWT token from the Authorization header.
+        token: JWT token from the Authorization header (optional).
         db: Database session.
 
     Returns:
-        The User object if the token is valid.
+        The User object if the token is valid, None if no token provided.
 
     Raises:
-        HTTPException: 401 if the token is invalid or the user doesn't exist.
+        HTTPException: 401 if a token is provided but invalid.
     """
+    if token is None:
+        return None  # guest user — no token provided
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username = payload.get("sub")
@@ -196,7 +222,8 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 async def is_valid_word(word: str) -> bool:
     """Check if a word exists in the Merriam-Webster Collegiate Dictionary.
 
-    Falls back to the Knuth word list if the API key is missing or the call fails.
+    Falls back to the Knuth word list if the API key is missing or the call fails,
+    so the game still works without an internet connection or a valid key.
 
     Args:
         word: The cleaned 5-letter guess to validate.
@@ -211,8 +238,11 @@ async def is_valid_word(word: str) -> bool:
         async with httpx.AsyncClient() as client:
             res = await client.get(url, timeout=3)
         data = res.json()
+        # MW returns a list of dicts if the word exists
+        # if the word doesn't exist it returns a list of strings (spelling suggestions)
         return isinstance(data, list) and len(data) > 0 and isinstance(data[0], dict)
     except Exception:
+        # if the API call fails for any reason, fall back to the Knuth word list
         return word in WORDS
 
 
@@ -280,7 +310,7 @@ def compute_feedback(guess: str, answer: str) -> list[str]:
     return feedback
 
 
-# ── Request/Response models ──────────────────────────────────────────────────
+# ── Request models ───────────────────────────────────────────────────────────
 
 class RegisterRequest(BaseModel):
     """Shape of the JSON body expected by POST /register."""
@@ -351,20 +381,54 @@ def get_answer():
     return {"answer": get_daily_word()}
 
 
+@app.get("/game")
+def get_game_state(current_user: Optional[User] = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Return today's game state for the current user.
+
+    Used to restore progress when a logged-in user refreshes the page.
+    Returns empty state for guests.
+
+    Args:
+        current_user: The authenticated user, or None for guests.
+        db: Database session.
+
+    Returns:
+        JSON with today's guesses, completion status, and win status.
+    """
+    if current_user is None:
+        return {"guesses": [], "completed": False, "won": False}
+
+    today = datetime.date.today()
+    record = db.query(GameRecord).filter(
+        GameRecord.username == current_user.username,
+        GameRecord.date == today,
+    ).first()
+
+    if record is None:
+        return {"guesses": [], "completed": False, "won": False}
+
+    import json
+    return {
+        "guesses": json.loads(record.guess_history),
+        "completed": record.completed,
+        "won": record.won,
+    }
+
+
 @app.post("/guess")
 async def guess(
     body: GuessRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: Optional[User] = Depends(get_current_user),
 ):
     """Score one 5-letter guess and return feedback for the UI to render.
 
-    Requires authentication. Tracks game state per user per day.
+    Works for both authenticated users (progress tracked) and guests (no tracking).
 
     Args:
         body: Request body containing the guess string.
         db: Database session.
-        current_user: The authenticated user making the guess.
+        current_user: The authenticated user, or None for guests.
 
     Returns:
         JSON with feedback, win status, and today's answer.
@@ -375,20 +439,22 @@ async def guess(
     today = datetime.date.today()
     secret = get_daily_word()
 
-    # get or create today's game record for this user
-    record = db.query(GameRecord).filter(
-        GameRecord.username == current_user.username,
-        GameRecord.date == today,
-    ).first()
+    # only track game state for logged-in users
+    record = None
+    if current_user is not None:
+        record = db.query(GameRecord).filter(
+            GameRecord.username == current_user.username,
+            GameRecord.date == today,
+        ).first()
 
-    if record is None:
-        record = GameRecord(username=current_user.username, date=today, guesses=0)
-        db.add(record)
-        db.commit()
-        db.refresh(record)
+        if record is None:
+            record = GameRecord(username=current_user.username, date=today, guesses=0, guess_history="[]")
+            db.add(record)
+            db.commit()
+            db.refresh(record)
 
-    if record.completed:
-        raise HTTPException(status_code=403, detail="You have already completed today's game")
+        if record.completed:
+            raise HTTPException(status_code=403, detail="You have already completed today's game")
 
     submitted_guess = clean_guess(body.guess)
     validate_guess(submitted_guess)
@@ -399,27 +465,30 @@ async def guess(
     feedback = compute_feedback(submitted_guess, secret)
     correct = submitted_guess == secret
 
-    # update game record
-    record.guesses += 1
-    if correct:
-        record.won = True
-        record.completed = True
-    elif record.guesses >= 6:
-        record.completed = True
-
-    db.commit()
+    # update game record for logged-in users
+    if record is not None:
+        import json
+        history = json.loads(record.guess_history)
+        history.append({"letters": list(submitted_guess), "feedbacks": feedback})
+        record.guess_history = json.dumps(history)
+        record.guesses += 1
+        if correct:
+            record.won = True
+            record.completed = True
+        elif record.guesses >= 6:
+            record.completed = True
+        db.commit()
 
     return {
         "guess": submitted_guess,
         "feedback": feedback,
         "correct": correct,
         "answer": secret,
-        "guesses_used": record.guesses,
     }
 
 
 @app.get("/stats")
-def get_stats(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+def get_stats(current_user: Optional[User] = Depends(get_current_user), db: Session = Depends(get_db)):
     """Return game stats for the current user.
 
     Args:
@@ -428,7 +497,13 @@ def get_stats(current_user: User = Depends(get_current_user), db: Session = Depe
 
     Returns:
         Total games played, wins, and win percentage.
+
+    Raises:
+        HTTPException: 401 if not logged in.
     """
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Must be logged in to view stats")
+
     records = db.query(GameRecord).filter(
         GameRecord.username == current_user.username,
         GameRecord.completed == True,
