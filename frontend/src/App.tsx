@@ -220,9 +220,9 @@ export default function App() {
   const [currentGuess, setCurrentGuess] = useState("")
   // keyStatuses: maps each letter to its best known feedback color (green > yellow > gray)
   const [keyStatuses, setKeyStatuses] = useState<Record<string, string>>(() => rebuildKeyStatuses(storedGame.guesses))
-  const [gameOver, setGameOver] = useState(storedGame.completed)
-  const [won, setWon] = useState(storedGame.won)
-  const [showResult, setShowResult] = useState(storedGame.completed)
+  const [gameOver, setGameOver] = useState(false)
+  const [won, setWon] = useState(false)
+  const [showResult, setShowResult] = useState(false)
   const [answer, setAnswer] = useState("")
   const [message, setMessage] = useState("") // error messages like "Not a valid word"
   const [loading, setLoading] = useState(false) // true while a guess request is in flight
@@ -232,21 +232,16 @@ export default function App() {
     const cached = readStoredGame(storageToken)
     const serverGuesses = data.guesses ?? []
     const savedGuesses = serverGuesses.length > 0 ? serverGuesses : useCacheFallback ? cached.guesses : []
-    const completed =
-      savedGuesses.length >= MAX_ATTEMPTS ||
-      Boolean(data.completed) ||
-      (useCacheFallback && cached.completed)
-    const hasPlayableState = savedGuesses.length > 0
-    const shouldBlockInput = completed && hasPlayableState
-    const savedWon = Boolean(data.won) || (useCacheFallback && cached.won)
+    const completed = !useCacheFallback && (savedGuesses.length >= MAX_ATTEMPTS || Boolean(data.completed))
+    const savedWon = !useCacheFallback && Boolean(data.won)
 
     setGuesses(savedGuesses)
     setKeyStatuses(rebuildKeyStatuses(savedGuesses))
     setCurrentGuess("")
-    setGameOver(shouldBlockInput)
+    setGameOver(completed)
     setWon(savedWon)
-    setShowResult(shouldBlockInput)
-    writeStoredGame(storageToken, { guesses: savedGuesses, completed: shouldBlockInput, won: savedWon })
+    setShowResult(completed)
+    writeStoredGame(storageToken, { guesses: savedGuesses, completed, won: savedWon })
   }, [token])
 
   // log out by clearing the token from state and localStorage
