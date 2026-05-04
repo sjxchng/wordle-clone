@@ -237,7 +237,6 @@ export default function App() {
 
     setGuesses(savedGuesses)
     setKeyStatuses(rebuildKeyStatuses(savedGuesses))
-    setCurrentGuess("")
     setGameOver(completed)
     setWon(savedWon)
     setShowResult(completed)
