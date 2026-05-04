@@ -165,48 +165,6 @@ function HowToPlay({ onClose }: { onClose: () => void }) {
   )
 }
 
-function ResultModal({
-  won,
-  answer,
-  guesses,
-  onClose,
-}: {
-  won: boolean
-  answer: string
-  guesses: number
-  onClose: () => void
-}) {
-  return (
-    <div style={modalBackdropStyle} onClick={onClose}>
-      <div style={{ ...modalPanelStyle, textAlign: "center" }} onClick={(e) => e.stopPropagation()}>
-        <button onClick={onClose} aria-label="Close" style={closeButtonStyle}>x</button>
-        <h2 style={{ color: "white", marginTop: 0 }}>{won ? "You won" : "Game over"}</h2>
-        <p style={{ color: "#d7dadc", lineHeight: 1.6, marginBottom: 20 }}>
-          {won
-            ? `Solved in ${guesses} ${guesses === 1 ? "guess" : "guesses"}.`
-            : `The word was ${answer.toUpperCase()}.`}
-        </p>
-        <button
-          onClick={onClose}
-          style={{
-            width: "100%",
-            padding: "10px 0",
-            backgroundColor: "#538d4e",
-            color: "white",
-            border: "none",
-            borderRadius: 4,
-            fontSize: 16,
-            fontWeight: "bold",
-            cursor: "pointer",
-          }}
-        >
-          Close
-        </button>
-      </div>
-    </div>
-  )
-}
-
 export default function App() {
   // token: JWT stored in localStorage so it persists across page refreshes
   const [token, setToken] = useState<string | null>(() => localStorage.getItem("token"))
@@ -222,11 +180,17 @@ export default function App() {
   const [keyStatuses, setKeyStatuses] = useState<Record<string, string>>(() => rebuildKeyStatuses(storedGame.guesses))
   const [gameOver, setGameOver] = useState(false)
   const [won, setWon] = useState(false)
-  const [showResult, setShowResult] = useState(false)
   const [answer, setAnswer] = useState("")
   const [message, setMessage] = useState("") // error messages like "Not a valid word"
   const [loading, setLoading] = useState(false) // true while a guess request is in flight
   const [showWakeupNotice, setShowWakeupNotice] = useState(false)
+  const [toast, setToast] = useState("") // auto-dismissing result message shown after win or loss
+
+  // showToast: displays a toast message that disappears after 3 seconds
+  function showToast(msg: string) {
+    setToast(msg)
+    setTimeout(() => setToast(""), 3000)
+  }
 
   const applyGameState = useCallback((data: GameState, storageToken = token, useCacheFallback = false) => {
     const cached = readStoredGame(storageToken)
@@ -239,7 +203,6 @@ export default function App() {
     setKeyStatuses(rebuildKeyStatuses(savedGuesses))
     setGameOver(completed)
     setWon(savedWon)
-    setShowResult(completed)
     writeStoredGame(storageToken, { guesses: savedGuesses, completed, won: savedWon })
   }, [token])
 
@@ -258,7 +221,6 @@ export default function App() {
     setKeyStatuses({})
     setGameOver(false)
     setWon(false)
-    setShowResult(false)
     setCurrentGuess("")
     setMessage("")
   }, [gameOver, guesses, token, won])
@@ -394,11 +356,11 @@ export default function App() {
         if (correct) {
           setWon(true)
           setGameOver(true)
-          setShowResult(true)
+          showToast(`You won in ${nextGuesses.length} ${nextGuesses.length === 1 ? "guess" : "guesses"}! 🎉`)
         } else if (nextGuesses.length >= MAX_ATTEMPTS) {
           setWon(false)
           setGameOver(true)
-          setShowResult(true)
+          showToast(`Game over! The word was ${guestAnswer.toUpperCase()}`)
         }
 
         return
@@ -426,11 +388,11 @@ export default function App() {
       if (data.correct) {
         setWon(true)
         setGameOver(true)
-        setShowResult(true)
+        showToast(`You won in ${nextGuesses.length} ${nextGuesses.length === 1 ? "guess" : "guesses"}! 🎉`)
       } else if (nextGuesses.length >= MAX_ATTEMPTS) {
         setWon(false)
         setGameOver(true)
-        setShowResult(true)
+        showToast(`Game over! The word was ${data.answer.toUpperCase()}`)
       }
     } catch {
       setMessage("Could not submit guess. Is the backend running?")
@@ -520,7 +482,7 @@ export default function App() {
             Waking up the free backend. First request may take up to a minute.
           </p>
         )}
-        {gameOver && !showResult && (
+        {gameOver && !toast && (
           <p style={{ color: "#d7dadc", marginTop: 20, fontSize: 16 }}>
             Today's game is complete. Come back tomorrow for a new word.
           </p>
@@ -540,16 +502,29 @@ export default function App() {
         )}
       </div>
 
+      {/* auto-dismissing toast shown after win or loss — disappears after 3 seconds */}
+      {toast && (
+        <div style={{
+          position: "fixed",
+          top: 80,
+          left: "50%",
+          transform: "translateX(-50%)",
+          backgroundColor: won ? "#538d4e" : "#3a3a3c",
+          color: "white",
+          padding: "12px 24px",
+          borderRadius: 8,
+          fontSize: 16,
+          fontWeight: "bold",
+          zIndex: 200,
+          boxShadow: "0 4px 12px rgba(0,0,0,0.4)",
+          whiteSpace: "nowrap",
+        }}>
+          {toast}
+        </div>
+      )}
+
       {/* modals */}
       {showHowToPlay && <HowToPlay onClose={() => setShowHowToPlay(false)} />}
-      {showResult && (
-        <ResultModal
-          won={won}
-          answer={answer}
-          guesses={guesses.length}
-          onClose={() => setShowResult(false)}
-        />
-      )}
       {showAuth && (
         <div style={modalBackdropStyle} onClick={() => setShowAuth(false)}>
           <div style={{ position: "relative" }}>
@@ -562,7 +537,7 @@ export default function App() {
               }}
             >x</button>
             <div onClick={(e) => e.stopPropagation()}>
-            <Auth onLogin={handleLogin} />
+              <Auth onLogin={handleLogin} />
             </div>
           </div>
         </div>
