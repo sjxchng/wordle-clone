@@ -1,4 +1,4 @@
-# Definitely Not Wordle
+# Wordle Clone
 
 A fullstack Wordle clone built with React + TypeScript, FastAPI, PostgreSQL, and JWT authentication.
 
