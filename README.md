@@ -26,6 +26,7 @@ The secret word is shared across all players and resets daily at midnight.
 - Optional login/register to save and restore daily progress across sessions
 - Daily word that changes at midnight and is consistent for all players
 - Word validation via the Merriam-Webster Collegiate Dictionary API
+- Answer withheld from all API responses until the game ends
 - On-screen keyboard with color feedback
 - Physical keyboard support
 - How to Play modal
@@ -42,6 +43,26 @@ The secret word is shared across all players and resets daily at midnight.
 - PostgreSQL via SQLAlchemy
 - JWT authentication with bcrypt password hashing
 - Hosted on Render
+
+## Architecture
+
+```
+Browser
+   │
+   │  HTTPS
+   ▼
+React SPA (Vercel)
+   │
+   │  HTTPS + JSON + JWT bearer
+   ▼
+FastAPI backend (Render)
+   │                    │
+   │  SQL (SQLAlchemy)  │  HTTPS
+   ▼                    ▼
+PostgreSQL (Render)   Merriam-Webster API
+```
+
+The daily word is derived server-side from `date.toordinal() % len(words)` — consistent across all instances without any coordination. The answer is never sent to the client while a game is in progress; it is included in the `/guess` response only once the game is complete.
 
 ## Running Locally
 
@@ -71,14 +92,14 @@ Frontend runs on `http://localhost:5173`, backend on `http://localhost:8000`.
 
 ## API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/answer` | Returns today's secret word |
-| POST | `/guess` | Accepts a 5-letter guess, returns per-letter feedback |
-| POST | `/register` | Creates a new user account |
-| POST | `/login` | Returns a JWT access token |
-| GET | `/game` | Restores today's saved game for a logged-in user |
-| GET | `/stats` | Returns win stats for a logged-in user |
+| Method | Endpoint | Auth required | Description |
+|--------|----------|---------------|-------------|
+| POST | `/register` | No | Creates a new user account |
+| POST | `/login` | No | Returns a JWT access token |
+| POST | `/guess` | Optional | Scores a 5-letter guess; answer included in response only on game over |
+| GET | `/game` | Yes | Restores today's saved game state for the logged-in user |
+| GET | `/stats` | Yes | Returns win stats for the logged-in user |
+| GET | `/answer` | Yes | Returns today's word (for debugging; requires login) |
 
 Guest players can use `/guess` without a token. Logged-in requests include a JWT so the backend can persist progress.
 
