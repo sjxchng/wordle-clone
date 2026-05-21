@@ -21,18 +21,21 @@ SECRET_KEY = os.getenv("SECRET_KEY", "changeme-in-production")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24  # tokens last 24 hours
 
-# password hashing — bcrypt is the industry standard
+# password hashing — bcrypt is the industry standard for storing passwords
+# it's intentionally slow (adaptive cost factor) to make brute-force attacks impractical
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 # oauth2_scheme with auto_error=False means auth is optional — unauthenticated requests are allowed
+# this lets guests play without logging in while still supporting JWT for registered users
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login", auto_error=False)
 
 app = FastAPI()
 
 app.add_middleware(
     # CORS = Cross-Origin Resource Sharing
-    # browsers block requests between different domains by default
-    # this tells the backend to allow requests from anywhere
+    # browsers enforce a same-origin policy that blocks fetch() calls to a different domain by default
+    # this middleware adds the Access-Control-Allow-Origin header so the Vercel frontend
+    # can call the Render backend even though they're on different domains
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
@@ -40,6 +43,7 @@ app.add_middleware(
 )
 
 WORD_LENGTH = 5 # used everywhere instead of hardcoding 5
+MAX_ATTEMPTS = 6 # classic Wordle allows 6 guesses
 
 # word list sourced from Donald Knuth's Stanford GraphBase:
 # https://www-cs-faculty.stanford.edu/~knuth/sgb-words.txt
@@ -76,14 +80,20 @@ class User(Base):
 class GameRecord(Base):
     """Stores one game record per user per day.
 
+    One row is created when a logged-in user makes their first guess of the day.
+    Subsequent guesses update that same row — there is at most one record per
+    (username, date) pair, enforced by the query in POST /guess.
+
     Attributes:
         id: Auto-incrementing primary key.
         username: Foreign key linking to the users table.
         date: The date this game was played.
-        guesses: Number of guesses used.
-        won: Whether the user won.
-        completed: Whether the game is finished (won or lost).
-        guess_history: JSON string of all guesses and their feedback.
+        guesses: Number of guesses used so far.
+        won: Whether the user has guessed correctly.
+        completed: Whether the game is finished (won or exhausted all attempts).
+        guess_history: JSON array of all submitted guesses and their per-letter feedback.
+                       Stored as text because SQLite/PostgreSQL portability is simpler
+                       than using a JSON column type.
     """
     __tablename__ = "game_records"
     id = Column(Integer, primary_key=True, autoincrement=True)
@@ -102,9 +112,10 @@ Base.metadata.create_all(bind=engine)
 def ensure_game_record_schema():
     """Add columns that older deployed databases may be missing.
 
-    SQLAlchemy's create_all creates missing tables, but it does not alter tables
-    that already exist. This keeps the Render database compatible after adding
-    progress restoration.
+    SQLAlchemy's create_all creates missing tables but does not ALTER existing ones.
+    This function patches the live Render database when new columns are added to the
+    model without a full migration tool like Alembic. It's safe to call on every
+    startup because it checks whether the column exists before running the ALTER.
     """
     inspector = inspect(engine)
     if "game_records" not in inspector.get_table_names():
@@ -125,6 +136,7 @@ def get_db():
     """Yield a database session and close it when done.
 
     Used as a FastAPI dependency — each request gets its own session.
+    The try/finally guarantees the session is closed even if the handler raises.
     """
     db = SessionLocal()
     try:
@@ -137,6 +149,11 @@ def get_db():
 
 def get_daily_word() -> str:
     """Pick a word based on today's date.
+
+    date.toordinal() returns a globally unique integer for each calendar day
+    (counting days since January 1st, year 1). Taking it modulo len(WORDS)
+    maps that integer to a stable index into the word list, so every player
+    sees the same word on the same day and it rotates automatically at midnight.
 
     Returns:
         A 5-letter word that stays the same all day and changes at midnight.
@@ -163,6 +180,9 @@ def hash_password(password: str) -> str:
 def verify_password(plain: str, hashed: str) -> bool:
     """Check if a plain text password matches a bcrypt hash.
 
+    bcrypt embeds the salt inside the hash string itself, so verify() can
+    re-derive the same salt and compare without storing it separately.
+
     Args:
         plain: The plain text password from the login request.
         hashed: The stored bcrypt hash from the database.
@@ -175,6 +195,10 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def create_access_token(username: str) -> str:
     """Create a signed JWT token for a user.
+
+    The token payload carries the username in the "sub" (subject) claim and
+    an "exp" (expiry) claim. The signature uses HMAC-SHA256 with SECRET_KEY,
+    so the server can verify the token without a database lookup on every request.
 
     Args:
         username: The username to encode in the token.
@@ -189,7 +213,10 @@ def create_access_token(username: str) -> str:
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> Optional[User]:
     """Decode a JWT token and return the corresponding user.
 
-    Returns None if no token is provided — allows guest access.
+    Returns None if no token is provided, which allows guest access on endpoints
+    that use this as an optional dependency. If a token is present but invalid
+    (malformed, expired, or for a deleted user), raises 401 rather than silently
+    treating the request as a guest.
 
     Args:
         token: JWT token from the Authorization header (optional).
@@ -199,7 +226,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         The User object if the token is valid, None if no token provided.
 
     Raises:
-        HTTPException: 401 if a token is provided but invalid.
+        HTTPException: 401 if a token is provided but invalid or expired.
     """
     if token is None:
         return None  # guest user — no token provided
@@ -209,6 +236,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         if username is None:
             raise HTTPException(status_code=401, detail="Invalid token")
     except JWTError:
+        # covers both malformed tokens and tokens past their exp claim
         raise HTTPException(status_code=401, detail="Invalid token")
 
     user = db.query(User).filter(User.username == username).first()
@@ -221,6 +249,10 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 
 async def is_valid_word(word: str) -> bool:
     """Check if a word exists in the Merriam-Webster Collegiate Dictionary.
+
+    The MW API returns a list of dicts when the exact word is found and a list
+    of suggestion strings when it isn't, so isinstance(data[0], dict) is a
+    reliable way to distinguish hits from misses without parsing the full response.
 
     Falls back to the Knuth word list if the API key is missing or the call fails,
     so the game still works without an internet connection or a valid key.
@@ -278,10 +310,22 @@ def validate_guess(guess: str) -> None:
 def compute_feedback(guess: str, answer: str) -> list[str]:
     """Return green/yellow/gray feedback for each letter in the guess.
 
-    Uses a two-pass approach to handle duplicate letters correctly:
-    - Pass 1: Mark greens (correct letter, correct position) and consume those letters.
-    - Pass 2: Mark yellows (correct letter, wrong position) using only unconsumed letters.
-    Anything unmatched stays gray.
+    Naively marking every letter that appears in the answer as yellow would
+    over-report matches when the guess contains duplicates. The two-pass approach
+    handles this correctly:
+
+    Pass 1 — greens: scan left-to-right; wherever guess[i] == answer[i], mark
+    green and "consume" that position in the answer pool by setting it to None.
+    Consumed positions can't contribute to yellows in pass 2.
+
+    Pass 2 — yellows: for each non-green position, check if guess[i] appears
+    anywhere in the remaining (non-None) pool. If so, mark yellow and consume
+    that pool entry so the same answer letter can't match twice.
+
+    Example: guess="speed", answer="abide"
+    - Pass 1: no greens (no position matches)
+    - Pass 2: 'e' at index 2 matches pool 'e' at index 4 → yellow; second 'e'
+      at index 3 finds no remaining 'e' in pool → gray
 
     Args:
         guess: The cleaned 5-letter guess submitted by the user.
@@ -294,13 +338,13 @@ def compute_feedback(guess: str, answer: str) -> list[str]:
     pool = list(answer)  # copy so we can null out matched letters
 
     # first pass: greens
-    for i in range(5):
+    for i in range(WORD_LENGTH):
         if guess[i] == pool[i]:
             feedback[i] = "green"
             pool[i] = None  # mark as used so it can't become a yellow
 
     # second pass: yellows
-    for i in range(5):
+    for i in range(WORD_LENGTH):
         if feedback[i] == "green":
             continue  # already matched, skip
         if guess[i] in pool:
@@ -353,6 +397,10 @@ def register(body: RegisterRequest, db: Session = Depends(get_db)):
 def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     """Log in and receive a JWT access token.
 
+    Uses OAuth2PasswordRequestForm (application/x-www-form-urlencoded) rather than
+    JSON because the OAuth2 spec requires form encoding for the token endpoint.
+    The frontend must send username/password as form data, not a JSON body.
+
     Args:
         form: OAuth2 form with username and password fields.
         db: Database session.
@@ -365,6 +413,7 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
     """
     user = db.query(User).filter(User.username == form.username).first()
     if not user or not verify_password(form.password, user.hashed_password):
+        # deliberately vague — don't tell the caller whether the username exists
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     token = create_access_token(user.username)
@@ -372,12 +421,20 @@ def login(form: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get
 
 
 @app.get("/answer")
-def get_answer():
+def get_answer(current_user: Optional[User] = Depends(get_current_user)):
     """Reveal today's secret word. Required by the project spec.
+
+    Requires authentication so the answer isn't trivially readable by guests
+    opening devtools and calling this endpoint directly.
 
     Returns:
         JSON with today's word.
+
+    Raises:
+        HTTPException: 401 if the request is unauthenticated.
     """
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Login required to view the answer")
     return {"answer": get_daily_word()}
 
 
@@ -386,7 +443,8 @@ def get_game_state(current_user: Optional[User] = Depends(get_current_user), db:
     """Return today's game state for the current user.
 
     Used to restore progress when a logged-in user refreshes the page.
-    Returns empty state for guests.
+    Returns empty state for guests — they rely on localStorage for persistence
+    and can only recover progress on the same device and browser.
 
     Args:
         current_user: The authenticated user, or None for guests.
@@ -423,7 +481,12 @@ async def guess(
 ):
     """Score one 5-letter guess and return feedback for the UI to render.
 
-    Works for both authenticated users (progress tracked) and guests (no tracking).
+    Works for both authenticated users (progress tracked in DB) and guests
+    (stateless — no DB writes, frontend tracks guess count in localStorage).
+
+    The answer is withheld from the response while the game is in progress.
+    It is only included once the game ends (correct guess or 6th attempt),
+    so it never appears in network traffic that a cheating player could intercept.
 
     Args:
         body: Request body containing the guess string.
@@ -431,7 +494,7 @@ async def guess(
         current_user: The authenticated user, or None for guests.
 
     Returns:
-        JSON with feedback, win status, and today's answer.
+        JSON with feedback, win status, and today's answer (only on game over).
 
     Raises:
         HTTPException: 400 if guess is invalid, 422 if not a real word, 403 if game is already over.
@@ -448,6 +511,7 @@ async def guess(
         ).first()
 
         if record is None:
+            # first guess of the day — create a fresh record
             record = GameRecord(username=current_user.username, date=today, guesses=0, guess_history="[]")
             db.add(record)
             db.commit()
@@ -466,6 +530,7 @@ async def guess(
     correct = submitted_guess == secret
 
     # update game record for logged-in users
+    game_completed = False
     if record is not None:
         import json
         history = json.loads(record.guess_history)
@@ -475,15 +540,23 @@ async def guess(
         if correct:
             record.won = True
             record.completed = True
-        elif record.guesses >= 6:
+        elif record.guesses >= MAX_ATTEMPTS:
             record.completed = True
         db.commit()
+        game_completed = record.completed
+    else:
+        # for guests, game_completed is only true on a correct guess —
+        # the frontend is responsible for tracking the guess count and
+        # detecting a loss when it reaches MAX_ATTEMPTS
+        game_completed = correct
 
+    # the answer is only sent when the game is over so it never appears in
+    # network responses that an active player could read from devtools
     return {
         "guess": submitted_guess,
         "feedback": feedback,
         "correct": correct,
-        "answer": secret,
+        "answer": secret if game_completed else None,
     }
 
 

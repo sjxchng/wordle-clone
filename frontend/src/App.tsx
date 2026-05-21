@@ -18,6 +18,8 @@ function getUsernameFromToken(token: string | null) {
   if (!token) return null
 
   try {
+    // JWTs are three base64url segments separated by dots: header.payload.signature
+    // the payload is the middle segment; atob decodes it from base64 to a JSON string
     const payload = JSON.parse(atob(token.split(".")[1]))
     return typeof payload.sub === "string" ? payload.sub : null
   } catch {
@@ -26,6 +28,8 @@ function getUsernameFromToken(token: string | null) {
 }
 
 function getStorageKey(token: string | null) {
+  // scoping the key by date and user means yesterday's guest cache doesn't bleed
+  // into today's game, and a logged-in user's state doesn't overwrite a guest's
   const user = getUsernameFromToken(token)
   return `definitely-not-wordle:${todayKey}:${user ?? "guest"}`
 }
@@ -55,6 +59,8 @@ function clearStoredGame(token: string | null) {
 }
 
 function rebuildKeyStatuses(guesses: Guess[]) {
+  // recompute keyboard colors from a saved guess list — used on initial render
+  // to restore key colors when the page loads with cached guesses
   const priority: Record<string, number> = { green: 3, yellow: 2, gray: 1 }
   const statuses: Record<string, string> = {}
 
@@ -68,30 +74,6 @@ function rebuildKeyStatuses(guesses: Guess[]) {
   })
 
   return statuses
-}
-
-function computeFeedback(guess: string, answer: string) {
-  const feedback = Array<string>(WORD_LENGTH).fill("gray")
-  const pool = answer.split("")
-
-  guess.split("").forEach((letter, index) => {
-    if (letter === pool[index]) {
-      feedback[index] = "green"
-      pool[index] = ""
-    }
-  })
-
-  guess.split("").forEach((letter, index) => {
-    if (feedback[index] === "green") return
-
-    const matchIndex = pool.indexOf(letter)
-    if (matchIndex !== -1) {
-      feedback[index] = "yellow"
-      pool[matchIndex] = ""
-    }
-  })
-
-  return feedback
 }
 
 const modalBackdropStyle: React.CSSProperties = {
@@ -178,9 +160,11 @@ export default function App() {
   const [currentGuess, setCurrentGuess] = useState("")
   // keyStatuses: maps each letter to its best known feedback color (green > yellow > gray)
   const [keyStatuses, setKeyStatuses] = useState<Record<string, string>>(() => rebuildKeyStatuses(storedGame.guesses))
-  const [gameOver, setGameOver] = useState(false)
-  const [won, setWon] = useState(false)
-  const [answer, setAnswer] = useState("")
+  const [gameOver, setGameOver] = useState(storedGame.completed)
+  const [won, setWon] = useState(storedGame.won)
+  // answer starts null and is only populated once the server reveals it at game-end —
+  // keeping it out of state while the game is active means it can't be read from devtools
+  const [answer, setAnswer] = useState<string | null>(null)
   const [message, setMessage] = useState("") // error messages like "Not a valid word"
   const [loading, setLoading] = useState(false) // true while a guess request is in flight
   const [showWakeupNotice, setShowWakeupNotice] = useState(false)
@@ -223,6 +207,7 @@ export default function App() {
     setWon(false)
     setCurrentGuess("")
     setMessage("")
+    setAnswer(null)
   }, [gameOver, guesses, token, won])
 
   const loadGameState = useCallback(async (authToken: string) => {
@@ -232,6 +217,7 @@ export default function App() {
       })
 
       if (res.status === 401) {
+        // token was rejected by the server (expired or revoked) — clear it and fall back to guest
         handleLogout()
         return
       }
@@ -244,23 +230,20 @@ export default function App() {
       const data = await res.json()
       applyGameState(data, authToken)
     } catch {
+      // network failure — recover from localStorage cache so the user isn't locked out
       applyGameState({}, authToken, true)
     }
   }, [applyGameState, handleLogout])
 
-  // fetch the answer when the app loads so we can reveal it on a loss
+  // show the wakeup notice after 2 s if the backend hasn't responded yet —
+  // Render's free tier spins down after inactivity and can take ~60 s to cold-start
   useEffect(() => {
     const wakeupTimer = window.setTimeout(() => setShowWakeupNotice(true), 2000)
-
-    fetch(`${API}/answer`)
-      .then((r) => r.json())
-      .then((data) => {
-        setAnswer(data.answer)
-        setShowWakeupNotice(false)
-      })
-      .catch(() => setMessage("Could not connect to the game server."))
-
-    return () => window.clearTimeout(wakeupTimer)
+    const hideTimer = window.setTimeout(() => setShowWakeupNotice(false), 8000)
+    return () => {
+      window.clearTimeout(wakeupTimer)
+      window.clearTimeout(hideTimer)
+    }
   }, [])
 
   // restore today's game state when a logged-in user loads the page
@@ -322,48 +305,10 @@ export default function App() {
       let res = await sendGuess(token)
 
       if (res.status === 401 && token) {
-        // Token expired. Drop back to guest mode and retry this same guess
-        // without showing a login/session warning.
+        // token expired mid-session — drop back to guest mode and retry the same guess
+        // transparently so the user doesn't see a login prompt mid-game
         handleLogout()
         res = await sendGuess(null)
-      }
-
-      if (res.status === 401 && !token) {
-        // Some deployed backend versions still protect /guess. Guests should
-        // still be able to play, so fall back to scoring from /answer.
-        const answerRes = await fetch(`${API}/answer`)
-        if (!answerRes.ok) {
-          setMessage("Could not submit guess. Is the backend running?")
-          return
-        }
-
-        const answerData = await answerRes.json()
-        const guestAnswer = answerData.answer
-        const normalizedGuess = currentGuess.toLowerCase()
-        const guestFeedback = computeFeedback(normalizedGuess, guestAnswer)
-        const newGuess = { letters: normalizedGuess.split(""), feedbacks: guestFeedback }
-        const nextGuesses = [...guesses, newGuess]
-        const correct = normalizedGuess === guestAnswer
-        const completed = correct || nextGuesses.length >= MAX_ATTEMPTS
-
-        setGuesses(nextGuesses)
-        setCurrentGuess("")
-        setMessage("")
-        setAnswer(guestAnswer)
-        updateKeyboardStatuses(normalizedGuess, guestFeedback)
-        writeStoredGame(null, { guesses: nextGuesses, completed, won: correct })
-
-        if (correct) {
-          setWon(true)
-          setGameOver(true)
-          showToast(`You won in ${nextGuesses.length} ${nextGuesses.length === 1 ? "guess" : "guesses"}! 🎉`)
-        } else if (nextGuesses.length >= MAX_ATTEMPTS) {
-          setWon(false)
-          setGameOver(true)
-          showToast(`Game over! The word was ${guestAnswer.toUpperCase()}`)
-        }
-
-        return
       }
 
       if (!res.ok) {
@@ -380,7 +325,12 @@ export default function App() {
       setGuesses(nextGuesses)
       setCurrentGuess("")
       setMessage("") // clear any previous error on a successful guess
-      setAnswer(data.answer) // backend returns the answer on every guess per the spec
+
+      // the server only includes "answer" in the response once the game is over;
+      // it's null for every in-progress guess so it never leaks via network traffic
+      if (data.answer) {
+        setAnswer(data.answer)
+      }
 
       updateKeyboardStatuses(data.guess, data.feedback)
       writeStoredGame(token, { guesses: nextGuesses, completed, won: data.correct })
@@ -392,7 +342,7 @@ export default function App() {
       } else if (nextGuesses.length >= MAX_ATTEMPTS) {
         setWon(false)
         setGameOver(true)
-        showToast(`Game over! The word was ${data.answer.toUpperCase()}`)
+        showToast(`Game over! The word was ${(data.answer ?? "???").toUpperCase()}`)
       }
     } catch {
       setMessage("Could not submit guess. Is the backend running?")
@@ -477,7 +427,7 @@ export default function App() {
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center", paddingTop: 30 }}>
         <Board guesses={guesses} currentGuess={currentGuess} maxAttempts={MAX_ATTEMPTS} />
         <Keyboard keyStatuses={keyStatuses} onKey={handleKey} />
-        {showWakeupNotice && !answer && (
+        {showWakeupNotice && (
           <p style={{ color: "#818384", marginTop: 20, fontSize: 13 }}>
             Waking up the free backend. First request may take up to a minute.
           </p>
