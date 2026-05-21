@@ -435,6 +435,9 @@ export default function App() {
         {gameOver && !toast && (
           <p style={{ color: "#d7dadc", marginTop: 20, fontSize: 16 }}>
             Today's game is complete. Come back tomorrow for a new word.
+            {answer && !won && (
+              <span style={{ color: "#818384" }}> The word was <strong style={{ color: "#d7dadc" }}>{answer.toUpperCase()}</strong>.</span>
+            )}
           </p>
         )}
         {message && <p style={{ color: "white", marginTop: 20, fontSize: 18 }}>{message}</p>}
