@@ -254,7 +254,7 @@ export default function App() {
     Promise.resolve()
       .then(() => loadGameState(token))
       .catch(() => applyGameState({}, token, true))
-  }, [applyGameState, loadGameState, token])
+  }, [token])
 
   // called by Auth component after successful login — saves token to state and localStorage
   async function handleLogin(newToken: string) {
